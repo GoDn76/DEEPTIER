@@ -18,6 +18,6 @@ USER appuser
 EXPOSE 8080
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
-  CMD ["sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+  CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/${SERVER_PORT:-8080}"]
 
 ENTRYPOINT ["java", "-jar", "/app/app.jar"]
