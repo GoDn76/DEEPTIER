@@ -33,6 +33,7 @@
 .vscode/
 
 # Secrets and CF variables management (strictly ignored)
+.env
 .env.local
 *.env.local
 vars.yml
