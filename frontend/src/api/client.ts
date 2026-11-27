@@ -27,6 +27,7 @@ import {
 
 export * from './types';
 
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
 const TOKEN_KEY = 'deeptier.accessToken';
 const USERNAME_KEY = 'deeptier.username';
 const ROLE_KEY = 'deeptier.role';
@@ -86,7 +87,7 @@ async function request<T>(
     headers.set('Idempotency-Key', crypto.randomUUID());
   }
 
-  const response = await fetch(path, {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
     headers,
     signal: init.signal ?? AbortSignal.timeout(options.timeoutMs ?? 30000),
