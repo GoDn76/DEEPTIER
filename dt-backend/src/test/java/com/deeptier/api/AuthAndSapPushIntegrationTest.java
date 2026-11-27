@@ -148,6 +148,17 @@ class AuthAndSapPushIntegrationTest {
                         .header("X-Internal-Key", props.internal().key()))
                 .andExpect(status().isOk());
 
+        // Python AI internal call to /api/whatif/simulate with X-Internal-Key succeeds (and 401 without it)
+        mvc.perform(post("/api/whatif/simulate")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"hsCode\":\"7325\",\"deltaPercentagePoints\":20}"))
+                .andExpect(status().isUnauthorized());
+        mvc.perform(post("/api/whatif/simulate")
+                        .header("X-Internal-Key", props.internal().key())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"hsCode\":\"7325\",\"deltaPercentagePoints\":20}"))
+                .andExpect(status().isOk());
+
         // 11. Admin can reset seed
         mvc.perform(post("/api/seed/reset?seed=20261121")
                         .header("Authorization", "Bearer " + adminToken))

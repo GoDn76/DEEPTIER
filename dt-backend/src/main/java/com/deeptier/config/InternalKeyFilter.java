@@ -4,6 +4,9 @@ import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.util.UrlPathHelper;
@@ -11,6 +14,7 @@ import org.springframework.web.util.UrlPathHelper;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.List;
 
 /**
  * Guards /internal/** endpoints with the X-Internal-Key header.
@@ -32,10 +36,13 @@ public class InternalKeyFilter extends OncePerRequestFilter {
                                     FilterChain filterChain)
             throws ServletException, IOException {
 
-        if (UrlPathHelper.defaultInstance.getPathWithinApplication(request).startsWith("/internal/")) {
-            String provided = request.getHeader("X-Internal-Key");
-            if (expectedKey.length == 0 || provided == null
-                    || !MessageDigest.isEqual(expectedKey, provided.getBytes(StandardCharsets.UTF_8))) {
+        String path = UrlPathHelper.defaultInstance.getPathWithinApplication(request);
+        String provided = request.getHeader("X-Internal-Key");
+        boolean validInternalKey = expectedKey.length > 0 && provided != null
+                && MessageDigest.isEqual(expectedKey, provided.getBytes(StandardCharsets.UTF_8));
+
+        if (path.startsWith("/internal/")) {
+            if (!validInternalKey) {
                 response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
                 response.setContentType("application/json");
                 response.getWriter().write(
@@ -43,6 +50,13 @@ public class InternalKeyFilter extends OncePerRequestFilter {
                 );
                 return;
             }
+        } else if (validInternalKey && SecurityContextHolder.getContext().getAuthentication() == null) {
+            UsernamePasswordAuthenticationToken auth = new UsernamePasswordAuthenticationToken(
+                    "python-ai-internal",
+                    null,
+                    List.of(new SimpleGrantedAuthority("ROLE_ANALYST"))
+            );
+            SecurityContextHolder.getContext().setAuthentication(auth);
         }
         filterChain.doFilter(request, response);
     }
