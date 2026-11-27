@@ -27,7 +27,11 @@ import {
 
 export * from './types';
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
+const API_BASE_URL = (
+  import.meta.env.VITE_API_ORIGIN ||
+  import.meta.env.VITE_API_BASE_URL ||
+  ''
+).replace(/\/+$/, '');
 const TOKEN_KEY = 'deeptier.accessToken';
 const USERNAME_KEY = 'deeptier.username';
 const ROLE_KEY = 'deeptier.role';
