@@ -54,21 +54,30 @@ export class ApiClientError extends Error {
 }
 
 export interface TierNodeDto {
-  nodeId: string;
-  tier: number;
+  id: string;
+  supplierId: string;
   name: string;
   country?: string;
+  tier: number;
   linkType?: string;
   confidence?: number;
+  dataClass?: string;
+  evidenceIds?: string;
+  createdAt?: string;
 }
 
 export interface TierLinkDto {
-  from: string;
-  to: string;
+  id: string;
+  fromSupplierId: string;
+  toSupplierId: string;
   hsCode?: string;
+  linkType?: string;
+  confidence?: number;
   annualSpendInr?: number;
   costFraction?: number;
-  linkType?: string;
+  dataClass?: string;
+  evidenceIds?: string;
+  createdAt?: string;
 }
 
 export interface TierMapGraphResponse {

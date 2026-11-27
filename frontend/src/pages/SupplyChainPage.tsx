@@ -1,11 +1,16 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Download,
   FileUp,
   GitBranch,
+  Maximize2,
+  Move,
   Network,
   RefreshCw,
+  RotateCcw,
   UploadCloud,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
 import {
   ApiClientError,
@@ -20,11 +25,71 @@ import { ErrorBanner } from '../components/ErrorBanner';
 import { StatusPill } from '../components/StatusPill';
 import { formatInr, formatPercent } from '../utils/format';
 
+interface NodePos {
+  x: number;
+  y: number;
+}
+
+const NODE_W = 176;
+const NODE_H = 52;
+const CANVAS_W = 1040;
+
+function computeInitialLayout(nodes: TierNodeDto[]): {
+  positions: Record<string, NodePos>;
+  canvasHeight: number;
+} {
+  const tierMap = new Map<number, TierNodeDto[]>();
+  for (const n of nodes) {
+    const t = n.tier ?? 0;
+    const list = tierMap.get(t) || [];
+    list.push(n);
+    tierMap.set(t, list);
+  }
+  const tiers = Array.from(tierMap.entries()).sort((a, b) => a[0] - b[0]);
+  const totalTiers = tiers.length;
+  const maxPerTier = tiers.reduce((max, [, list]) => Math.max(max, list.length), 1);
+  const canvasHeight = Math.max(460, maxPerTier * 84 + 64);
+  const usableHeight = canvasHeight - 64;
+
+  const positions: Record<string, NodePos> = {};
+  tiers.forEach(([, tierNodes], tierIdx) => {
+    const x = totalTiers === 1 ? CANVAS_W / 2 : 140 + (tierIdx / (totalTiers - 1)) * (CANVAS_W - 280);
+    const slotHeight = usableHeight / Math.max(tierNodes.length, 1);
+    tierNodes.forEach((node, nodeIdx) => {
+      const y = 32 + nodeIdx * slotHeight + slotHeight / 2;
+      positions[node.id] = { x, y };
+    });
+  });
+
+  return { positions, canvasHeight };
+}
+
 export function SupplyChainPage() {
   const { notify } = useToast();
   const [graph, setGraph] = useState<TierMapGraphResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+
+  // Interactive pan, zoom, and draggable node positions
+  const [nodePositions, setNodePositions] = useState<Record<string, NodePos>>({});
+  const [canvasHeight, setCanvasHeight] = useState(460);
+  const [zoom, setZoom] = useState(0.85);
+  const [pan, setPan] = useState({ x: 16, y: 12 });
+
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const dragStateRef = useRef<
+    | { type: 'pan'; startX: number; startY: number; origPanX: number; origPanY: number }
+    | {
+        type: 'node';
+        nodeId: string;
+        startX: number;
+        startY: number;
+        origX: number;
+        origY: number;
+        moved: boolean;
+      }
+    | null
+  >(null);
 
   const [mode, setMode] = useState<'replace' | 'append'>('replace');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -32,25 +97,57 @@ export function SupplyChainPage() {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<unknown>(null);
 
+  const applyAutoLayout = useCallback((nodes: TierNodeDto[]) => {
+    const { positions, canvasHeight: h } = computeInitialLayout(nodes);
+    setNodePositions(positions);
+    setCanvasHeight(h);
+    // Auto-fit zoom slightly if there are many nodes
+    setZoom(nodes.length > 10 ? 0.72 : 0.9);
+    setPan({ x: 16, y: 12 });
+  }, []);
+
   const loadGraph = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const data = await tierMapApi.getGraph();
       setGraph(data);
-      if (data.nodes.length > 0 && !selectedNodeId) {
-        setSelectedNodeId(data.nodes[0].nodeId);
-      }
+      applyAutoLayout(data.nodes);
+      setSelectedNodeId((prev) => {
+        if (data.nodes.length === 0) return null;
+        if (prev && data.nodes.some((n) => n.id === prev)) return prev;
+        return data.nodes[0].id;
+      });
     } catch (err) {
       setError(err);
     } finally {
       setLoading(false);
     }
-  }, [selectedNodeId]);
+  }, [applyAutoLayout]);
 
   useEffect(() => {
     void loadGraph();
   }, [loadGraph]);
+
+  const nodeMap = useMemo(() => {
+    const m = new Map<string, TierNodeDto>();
+    for (const n of graph?.nodes || []) m.set(n.id, n);
+    return m;
+  }, [graph]);
+
+  const selectedNode = useMemo(
+    () => (selectedNodeId ? nodeMap.get(selectedNodeId) || null : null),
+    [nodeMap, selectedNodeId],
+  );
+
+  const connectedLinks = useMemo(() => {
+    if (!selectedNodeId || !graph)
+      return { inbound: [] as TierLinkDto[], outbound: [] as TierLinkDto[] };
+    return {
+      inbound: graph.links.filter((l) => l.toSupplierId === selectedNodeId),
+      outbound: graph.links.filter((l) => l.fromSupplierId === selectedNodeId),
+    };
+  }, [graph, selectedNodeId]);
 
   const nodesByTier = useMemo(() => {
     const map = new Map<number, TierNodeDto[]>();
@@ -63,18 +160,73 @@ export function SupplyChainPage() {
     return Array.from(map.entries()).sort((a, b) => a[0] - b[0]);
   }, [graph]);
 
-  const selectedNode = useMemo(
-    () => (graph?.nodes || []).find((n) => n.nodeId === selectedNodeId) || null,
-    [graph, selectedNodeId],
-  );
-
-  const connectedLinks = useMemo(() => {
-    if (!selectedNodeId || !graph) return { inbound: [] as TierLinkDto[], outbound: [] as TierLinkDto[] };
-    return {
-      inbound: graph.links.filter((l) => l.to === selectedNodeId),
-      outbound: graph.links.filter((l) => l.from === selectedNodeId),
+  // Pointer handlers for panning canvas & dragging nodes
+  const handleCanvasPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (e.button !== 0) return;
+    (e.currentTarget as SVGSVGElement).setPointerCapture(e.pointerId);
+    dragStateRef.current = {
+      type: 'pan',
+      startX: e.clientX,
+      startY: e.clientY,
+      origPanX: pan.x,
+      origPanY: pan.y,
     };
-  }, [graph, selectedNodeId]);
+  };
+
+  const handleNodePointerDown = (e: React.PointerEvent<SVGGElement>, nodeId: string) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    const pos = nodePositions[nodeId];
+    if (!pos) return;
+    svgRef.current?.setPointerCapture(e.pointerId);
+    dragStateRef.current = {
+      type: 'node',
+      nodeId,
+      startX: e.clientX,
+      startY: e.clientY,
+      origX: pos.x,
+      origY: pos.y,
+      moved: false,
+    };
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const ds = dragStateRef.current;
+    if (!ds) return;
+    const dx = e.clientX - ds.startX;
+    const dy = e.clientY - ds.startY;
+    if (ds.type === 'pan') {
+      setPan({ x: ds.origPanX + dx, y: ds.origPanY + dy });
+    } else if (ds.type === 'node') {
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+        ds.moved = true;
+      }
+      setNodePositions((prev) => ({
+        ...prev,
+        [ds.nodeId]: {
+          x: ds.origX + dx / zoom,
+          y: ds.origY + dy / zoom,
+        },
+      }));
+    }
+  };
+
+  const handlePointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
+    const ds = dragStateRef.current;
+    if (ds?.type === 'node' && !ds.moved) {
+      setSelectedNodeId(ds.nodeId);
+    }
+    if (svgRef.current?.hasPointerCapture(e.pointerId)) {
+      svgRef.current.releasePointerCapture(e.pointerId);
+    }
+    dragStateRef.current = null;
+  };
+
+  const handleWheel = (e: React.WheelEvent<SVGSVGElement>) => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.1 : 0.9;
+    setZoom((z) => Math.min(2.0, Math.max(0.35, Number((z * factor).toFixed(2)))));
+  };
 
   const handleDownloadTemplate = async () => {
     try {
@@ -114,6 +266,15 @@ export function SupplyChainPage() {
   const validationErrors: (ProblemValidationError | string)[] =
     error instanceof ApiClientError && Array.isArray(error.errors) ? error.errors : [];
 
+  const nodeColor = (node: TierNodeDto) => {
+    if (node.country?.toUpperCase() === 'CN')
+      return { fill: '#FEF2F2', stroke: '#FECACA', text: '#991B1B' };
+    if (node.linkType?.toUpperCase().includes('BACKUP') || node.id.includes('RAJKOT'))
+      return { fill: '#ECFDF5', stroke: '#A7F3D0', text: '#065F46' };
+    if (node.tier === 0) return { fill: '#EFF6FF', stroke: '#BFDBFE', text: '#1E40AF' };
+    return { fill: '#FFFFFF', stroke: '#D9E2EC', text: '#102738' };
+  };
+
   return (
     <div className="space-y-5">
       {/* Header */}
@@ -123,7 +284,7 @@ export function SupplyChainPage() {
             Multi-Tier Supply Chain &amp; BOM Onboarding
           </h1>
           <p className="mt-0.5 text-[13px] text-[#5B7083]">
-            Interactive Tier-0 → Tier-2+ dependency topology with 14-column CSV BOM importer.
+            Drag nodes to rearrange, drag canvas to pan, or scroll to zoom.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -191,21 +352,63 @@ export function SupplyChainPage() {
         </div>
       )}
 
-      {/* Interactive Tier Graph + Node Inspector */}
+      {/* Interactive Pan/Zoom/Draggable SVG Tier Graph + Node Inspector */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
         <section className="dt-card lg:col-span-8 p-4">
-          <div className="flex items-center justify-between border-b border-[#D9E2EC] pb-3 mb-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#D9E2EC] pb-3 mb-3">
             <div className="flex items-center gap-2">
               <Network className="h-4 w-4 text-[#0A6ED1]" />
               <h2 className="text-[14px] font-semibold text-[#102738]">
                 Tier Dependency Topology
               </h2>
+              <span className="text-[12px] text-[#5B7083]">
+                · <span className="font-mono-tabular">{graph?.totalNodes ?? 0}</span> nodes ·{' '}
+                <span className="font-mono-tabular">{graph?.links.length ?? 0}</span> links
+              </span>
             </div>
-            <div className="flex items-center gap-2 text-[12px] text-[#5B7083]">
-              <span className="font-mono-tabular">{graph?.totalNodes ?? 0}</span> nodes
-              <span>·</span>
-              <span className="font-mono-tabular">{graph?.links.length ?? 0}</span> links
-              {graph?.dataClass && <StatusPill label={graph.dataClass} tone="neutral" />}
+
+            {/* Pan & Zoom Controls */}
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setZoom((z) => Math.max(0.35, Number((z - 0.15).toFixed(2))))}
+                className="dt-btn-secondary px-2 py-1 text-[11px]"
+                title="Zoom Out (Make Smaller)"
+              >
+                <ZoomOut className="h-3.5 w-3.5" />
+              </button>
+              <span className="font-mono-tabular text-[11px] text-[#5B7083] w-11 text-center">
+                {Math.round(zoom * 100)}%
+              </span>
+              <button
+                type="button"
+                onClick={() => setZoom((z) => Math.min(2.0, Number((z + 0.15).toFixed(2))))}
+                className="dt-btn-secondary px-2 py-1 text-[11px]"
+                title="Zoom In (Make Larger)"
+              >
+                <ZoomIn className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setZoom(0.65);
+                  setPan({ x: 16, y: 12 });
+                }}
+                className="dt-btn-secondary px-2 py-1 text-[11px]"
+                title="Compact Fit"
+              >
+                <Maximize2 className="h-3.5 w-3.5" />
+                Fit
+              </button>
+              <button
+                type="button"
+                onClick={() => graph && applyAutoLayout(graph.nodes)}
+                className="dt-btn-secondary px-2 py-1 text-[11px]"
+                title="Reset Node Positions"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                Reset
+              </button>
             </div>
           </div>
 
@@ -213,69 +416,228 @@ export function SupplyChainPage() {
             <div className="py-16 text-center text-[13px] text-[#5B7083]">
               Loading multi-tier dependency graph…
             </div>
-          ) : nodesByTier.length === 0 ? (
+          ) : (graph?.nodes.length ?? 0) === 0 ? (
             <div className="rounded-lg border border-dashed border-[#CBD5E1] py-14 text-center text-[13px] text-[#5B7083]">
               No supplier nodes found. Upload a BOM CSV below or seed the baseline from Executive
               Cockpit.
             </div>
           ) : (
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-              {nodesByTier.map(([tier, tierNodes]) => (
-                <div
-                  key={tier}
-                  className="rounded-lg border border-[#D9E2EC] bg-[#F8FAFC] p-3 space-y-2.5"
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="text-[11px] font-bold uppercase tracking-wider text-[#5B7083]">
-                      Tier {tier} {tier === 0 ? '(OEM)' : tier === 1 ? '(Direct)' : '(Sub-Tier)'}
-                    </span>
-                    <span className="font-mono-tabular text-[11px] text-[#5B7083]">
-                      {tierNodes.length}
-                    </span>
-                  </div>
-
-                  {tierNodes.map((node) => {
-                    const isSelected = node.nodeId === selectedNodeId;
-                    const isBackup =
-                      node.linkType?.toUpperCase().includes('BACKUP') ||
-                      node.nodeId.includes('RJK');
-                    const isRisk = node.country?.toUpperCase() === 'CN' || node.nodeId.includes('BETA');
-                    return (
-                      <button
-                        key={node.nodeId}
-                        type="button"
-                        onClick={() => setSelectedNodeId(node.nodeId)}
-                        className={`w-full rounded-lg border p-3 text-left transition-colors ${
-                          isSelected
-                            ? 'border-[#0A6ED1] bg-[#EFF6FF]'
-                            : 'border-[#D9E2EC] bg-white hover:border-[#94A3B8]'
-                        }`}
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <span className="text-[13px] font-semibold text-[#102738]">
-                            {node.name}
-                          </span>
-                          {isRisk && <StatusPill label="CN · RISK" tone="critical" />}
-                          {isBackup && <StatusPill label="BACKUP" tone="success" />}
-                        </div>
-                        <div className="mt-1.5 flex items-center justify-between text-[11px] text-[#5B7083]">
-                          <span className="font-mono-tabular">{node.nodeId}</span>
-                          <span>{node.country || '—'}</span>
-                        </div>
-                        {node.confidence != null && (
-                          <div className="mt-1 text-[11px] text-[#5B7083]">
-                            Confidence:{' '}
-                            <span className="font-mono-tabular font-medium text-[#102738]">
-                              {formatPercent(node.confidence, node.confidence <= 1)}
-                            </span>
-                          </div>
-                        )}
-                      </button>
-                    );
-                  })}
+            <>
+              <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  {nodesByTier.map(([tier]) => (
+                    <StatusPill
+                      key={tier}
+                      label={`Tier ${tier}${tier === 0 ? ' (OEM)' : tier === 1 ? ' (Direct)' : tier === 2 ? ' (Sub-Tier)' : ''}`}
+                      tone={tier === 0 ? 'ai' : tier <= 1 ? 'neutral' : 'warning'}
+                    />
+                  ))}
                 </div>
-              ))}
-            </div>
+                <span className="inline-flex items-center gap-1 text-[11px] text-[#5B7083]">
+                  <Move className="h-3 w-3" /> Drag nodes to adjust · Drag background to pan
+                </span>
+              </div>
+
+              {/* Interactive Pan/Zoom SVG Viewport */}
+              <div className="h-[460px] w-full overflow-hidden rounded-lg border border-[#D9E2EC] bg-[#F8FAFC] select-none">
+                <svg
+                  ref={svgRef}
+                  onPointerDown={handleCanvasPointerDown}
+                  onPointerMove={handlePointerMove}
+                  onPointerUp={handlePointerUp}
+                  onWheel={handleWheel}
+                  className="h-full w-full cursor-grab active:cursor-grabbing touch-none"
+                  style={{
+                    backgroundImage: 'radial-gradient(#CBD5E1 1px, transparent 1px)',
+                    backgroundSize: '20px 20px',
+                  }}
+                >
+                  <defs>
+                    <marker
+                      id="arrow"
+                      viewBox="0 0 10 10"
+                      refX="9"
+                      refY="5"
+                      markerWidth="6"
+                      markerHeight="6"
+                      orient="auto"
+                    >
+                      <path d="M 0 1 L 10 5 L 0 9 z" fill="#64748B" />
+                    </marker>
+                    <marker
+                      id="arrow-active"
+                      viewBox="0 0 10 10"
+                      refX="9"
+                      refY="5"
+                      markerWidth="6"
+                      markerHeight="6"
+                      orient="auto"
+                    >
+                      <path d="M 0 1 L 10 5 L 0 9 z" fill="#0A6ED1" />
+                    </marker>
+                  </defs>
+
+                  <g transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}>
+                    {/* Render edges */}
+                    {(graph?.links || []).map((link) => {
+                      const from = nodePositions[link.fromSupplierId];
+                      const to = nodePositions[link.toSupplierId];
+                      if (!from || !to) return null;
+
+                      const isSelected =
+                        link.fromSupplierId === selectedNodeId ||
+                        link.toSupplierId === selectedNodeId;
+                      const isDashed = link.linkType?.toUpperCase() === 'INFERRED';
+
+                      // Connect cleanly from right edge of source to left edge of target
+                      const x1 = from.x + (to.x >= from.x ? NODE_W / 2 : -NODE_W / 2);
+                      const y1 = from.y;
+                      const x2 = to.x + (to.x >= from.x ? -NODE_W / 2 : NODE_W / 2);
+                      const y2 = to.y;
+                      const midX = (x1 + x2) / 2;
+                      const midY = (y1 + y2) / 2;
+
+                      return (
+                        <g key={link.id} opacity={selectedNodeId && !isSelected ? 0.35 : 1}>
+                          <path
+                            d={`M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}`}
+                            fill="none"
+                            stroke={isSelected ? '#0A6ED1' : '#94A3B8'}
+                            strokeWidth={isSelected ? 2.2 : 1.4}
+                            strokeDasharray={isDashed ? '5 3' : undefined}
+                            markerEnd={isSelected ? 'url(#arrow-active)' : 'url(#arrow)'}
+                          />
+                          {isSelected && link.hsCode && (
+                            <g transform={`translate(${midX}, ${midY})`}>
+                              <rect
+                                x={-42}
+                                y={-10}
+                                width={84}
+                                height={18}
+                                rx={4}
+                                fill="#FFFFFF"
+                                stroke="#BFDBFE"
+                                strokeWidth={1}
+                              />
+                              <text
+                                x={0}
+                                y={2}
+                                textAnchor="middle"
+                                fontSize="9.5"
+                                fontFamily="IBM Plex Mono, monospace"
+                                fontWeight="600"
+                                fill="#0A6ED1"
+                              >
+                                HS {link.hsCode}
+                                {link.costFraction != null
+                                  ? ` · ${(link.costFraction * 100).toFixed(0)}%`
+                                  : ''}
+                              </text>
+                            </g>
+                          )}
+                        </g>
+                      );
+                    })}
+
+                    {/* Render draggable nodes */}
+                    {(graph?.nodes || []).map((node) => {
+                      const pos = nodePositions[node.id];
+                      if (!pos) return null;
+                      const isSelected = node.id === selectedNodeId;
+                      const colors = nodeColor(node);
+                      const isRisk = node.country?.toUpperCase() === 'CN';
+                      const isBackup =
+                        node.linkType?.toUpperCase().includes('BACKUP') ||
+                        node.id.includes('RAJKOT');
+
+                      return (
+                        <g
+                          key={node.id}
+                          transform={`translate(${pos.x}, ${pos.y})`}
+                          onPointerDown={(e) => handleNodePointerDown(e, node.id)}
+                          className="cursor-move"
+                        >
+                          <rect
+                            x={-NODE_W / 2}
+                            y={-NODE_H / 2}
+                            width={NODE_W}
+                            height={NODE_H}
+                            rx={8}
+                            fill={colors.fill}
+                            stroke={isSelected ? '#0A6ED1' : colors.stroke}
+                            strokeWidth={isSelected ? 2.2 : 1}
+                          />
+                          <text
+                            x={-8}
+                            y={-5}
+                            textAnchor="middle"
+                            fontSize="11"
+                            fontWeight="600"
+                            fill={colors.text}
+                          >
+                            {node.name.length > 20 ? node.name.slice(0, 18) + '…' : node.name}
+                          </text>
+                          <text
+                            x={0}
+                            y={12}
+                            textAnchor="middle"
+                            fontSize="9.5"
+                            fontFamily="IBM Plex Mono, monospace"
+                            fill="#5B7083"
+                          >
+                            {node.supplierId} · {node.country || '—'}
+                            {isRisk ? ' ⚠' : ''}
+                            {isBackup ? ' ✓' : ''}
+                          </text>
+                          <rect
+                            x={NODE_W / 2 - 30}
+                            y={-NODE_H / 2 + 4}
+                            width={25}
+                            height={15}
+                            rx={3}
+                            fill={isSelected ? '#0A6ED1' : '#E2E8F0'}
+                          />
+                          <text
+                            x={NODE_W / 2 - 17.5}
+                            y={-NODE_H / 2 + 14.5}
+                            textAnchor="middle"
+                            fontSize="8.5"
+                            fontWeight="700"
+                            fill={isSelected ? '#FFF' : '#5B7083'}
+                          >
+                            T{node.tier}
+                          </text>
+                        </g>
+                      );
+                    })}
+                  </g>
+                </svg>
+              </div>
+
+              {/* Legend */}
+              <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#5B7083]">
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className="flex items-center gap-1.5">
+                    <span className="inline-block h-0.5 w-6 bg-[#94A3B8]" /> DECLARED link
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="inline-block h-0.5 w-6 border-t-2 border-dashed border-[#94A3B8]" />{' '}
+                    INFERRED link
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="inline-block h-3 w-3 rounded border border-[#FECACA] bg-[#FEF2F2]" />{' '}
+                    China (Risk)
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="inline-block h-3 w-3 rounded border border-[#A7F3D0] bg-[#ECFDF5]" />{' '}
+                    Backup Supplier
+                  </span>
+                </div>
+                <span className="text-[10px] text-[#94A3B8]">
+                  Virtual Canvas: {CANVAS_W}×{canvasHeight}px
+                </span>
+              </div>
+            </>
           )}
         </section>
 
@@ -294,7 +656,7 @@ export function SupplyChainPage() {
                 </div>
                 <div className="mt-1 text-[15px] font-bold text-[#102738]">{selectedNode.name}</div>
                 <div className="mt-0.5 font-mono-tabular text-[#5B7083]">
-                  {selectedNode.nodeId} · Tier {selectedNode.tier}
+                  {selectedNode.supplierId} · Tier {selectedNode.tier}
                 </div>
               </div>
 
@@ -307,8 +669,25 @@ export function SupplyChainPage() {
                 </div>
                 <div>
                   <div className="text-[11px] text-[#5B7083]">Link Type</div>
+                  <div className="mt-0.5">
+                    <StatusPill
+                      label={selectedNode.linkType || 'DECLARED'}
+                      tone={selectedNode.linkType === 'INFERRED' ? 'warning' : 'success'}
+                    />
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] text-[#5B7083]">Confidence</div>
                   <div className="mt-0.5 font-mono-tabular font-semibold text-[#102738]">
-                    {selectedNode.linkType || 'PRIMARY'}
+                    {selectedNode.confidence != null
+                      ? formatPercent(selectedNode.confidence, selectedNode.confidence <= 1)
+                      : '—'}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] text-[#5B7083]">Data Class</div>
+                  <div className="mt-0.5">
+                    <StatusPill label={selectedNode.dataClass || 'LIVE'} tone="neutral" />
                   </div>
                 </div>
               </div>
@@ -317,35 +696,89 @@ export function SupplyChainPage() {
                 <div className="text-[11px] font-semibold uppercase tracking-wider text-[#5B7083] mb-2">
                   Supply Links ({connectedLinks.inbound.length + connectedLinks.outbound.length})
                 </div>
-                <div className="space-y-2">
-                  {[...connectedLinks.outbound, ...connectedLinks.inbound].map((link, idx) => (
-                    <div
-                      key={`${link.from}-${link.to}-${idx}`}
-                      className="rounded-md border border-[#D9E2EC] bg-white p-2.5"
-                    >
-                      <div className="flex items-center justify-between font-mono-tabular text-[11px]">
-                        <span className="font-semibold text-[#102738]">
-                          {link.from} → {link.to}
-                        </span>
-                        {link.hsCode && <StatusPill label={`HS ${link.hsCode}`} tone="neutral" />}
+                <div className="space-y-2 max-h-[240px] overflow-y-auto pr-1">
+                  {connectedLinks.outbound.map((link) => {
+                    const target = nodeMap.get(link.toSupplierId);
+                    return (
+                      <div
+                        key={link.id}
+                        className="rounded-md border border-[#D9E2EC] bg-white p-2.5"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[11px] font-semibold text-[#102738]">
+                            → {target?.name || link.toSupplierId}
+                          </span>
+                          {link.hsCode && <StatusPill label={`HS ${link.hsCode}`} tone="neutral" />}
+                        </div>
+                        <div className="mt-1.5 flex items-center justify-between text-[11px] text-[#5B7083]">
+                          <span>
+                            Spend:{' '}
+                            <span className="font-mono-tabular font-medium text-[#102738]">
+                              {formatInr(link.annualSpendInr)}
+                            </span>
+                          </span>
+                          <span>
+                            Share:{' '}
+                            <span className="font-mono-tabular font-medium text-[#102738]">
+                              {formatPercent(link.costFraction, true)}
+                            </span>
+                          </span>
+                        </div>
                       </div>
-                      <div className="mt-1.5 flex items-center justify-between text-[11px] text-[#5B7083]">
-                        <span>Spend: {formatInr(link.annualSpendInr)}</span>
-                        <span className="font-mono-tabular">
-                          Share: {formatPercent(link.costFraction, true)}
-                        </span>
+                    );
+                  })}
+                  {connectedLinks.inbound.map((link) => {
+                    const source = nodeMap.get(link.fromSupplierId);
+                    return (
+                      <div
+                        key={link.id}
+                        className="rounded-md border border-[#D9E2EC] bg-white p-2.5"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[11px] font-semibold text-[#102738]">
+                            ← {source?.name || link.fromSupplierId}
+                          </span>
+                          {link.hsCode && <StatusPill label={`HS ${link.hsCode}`} tone="neutral" />}
+                        </div>
+                        <div className="mt-1.5 flex items-center justify-between text-[11px] text-[#5B7083]">
+                          <span>
+                            Spend:{' '}
+                            <span className="font-mono-tabular font-medium text-[#102738]">
+                              {formatInr(link.annualSpendInr)}
+                            </span>
+                          </span>
+                          <span>
+                            Share:{' '}
+                            <span className="font-mono-tabular font-medium text-[#102738]">
+                              {formatPercent(link.costFraction, true)}
+                            </span>
+                          </span>
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                   {connectedLinks.inbound.length + connectedLinks.outbound.length === 0 && (
                     <div className="text-[#5B7083]">No direct links for this node.</div>
                   )}
                 </div>
               </div>
+
+              {selectedNode.evidenceIds && (
+                <div>
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[#5B7083] mb-1">
+                    Evidence IDs
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {selectedNode.evidenceIds.split(/[,;]/).map((eid) => (
+                      <StatusPill key={eid.trim()} label={eid.trim()} tone="ai" />
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           ) : (
             <div className="py-12 text-center text-[12px] text-[#5B7083]">
-              Select a node in the topology to inspect HS codes, spend share, and tier links.
+              Click a node in the topology to inspect HS codes, spend share, and tier links.
             </div>
           )}
         </aside>
@@ -398,9 +831,7 @@ export function SupplyChainPage() {
             if (f) setSelectedFile(f);
           }}
           className={`rounded-lg border-2 border-dashed p-6 text-center transition-colors ${
-            dragActive
-              ? 'border-[#0A6ED1] bg-[#EFF6FF]'
-              : 'border-[#CBD5E1] bg-[#F8FAFC]'
+            dragActive ? 'border-[#0A6ED1] bg-[#EFF6FF]' : 'border-[#CBD5E1] bg-[#F8FAFC]'
           }`}
         >
           <UploadCloud className="mx-auto h-7 w-7 text-[#5B7083]" />

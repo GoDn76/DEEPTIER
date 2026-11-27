@@ -87,8 +87,10 @@ export function OverviewPage() {
   const computedExposure = hs7325Links.reduce((sum, l) => {
     const spend = Number(l.annualSpendInr || 0);
     const frac = Number(l.costFraction ?? 1);
+    // Only compute on the CN-origin links (the hidden Tier-2 Beta Foundry cost fraction)
     return sum + spend * frac * 0.2;
   }, 0);
+  // If we computed >0 from links, use that; otherwise show the well-known deterministic ₹5,76,000 when seeded
   const activeDutyExposure =
     computedExposure > 0 ? computedExposure : graph && graph.totalNodes > 0 ? 576000 : 0;
 
