@@ -1,40 +1,15 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: deeptier-postgres
-    environment:
-      POSTGRES_DB: ${DB_NAME:-deeptier}
-      POSTGRES_USER: ${DB_USERNAME:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-postgres} -d ${DB_NAME:-deeptier}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - deeptier-net
-
   ai:
     build:
       context: ./AI
       dockerfile: Dockerfile
     container_name: deeptier-ai
     env_file:
-      - path: ./.env
+      - path: ./.env.ai
         required: false
     environment:
       PORT: 8000
       DEEPTIER_BACKEND_URL: http://dt-backend:8080
-      DEEPTIER_INTERNAL_KEY: ${DEEPTIER_INTERNAL_KEY:-dt-internal-dev-key-2026}
-      GEMINI_ENABLED: ${GEMINI_ENABLED:-false}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
-      GEMINI_TIMEOUT_MS: ${GEMINI_TIMEOUT_MS:-10000}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
       - "8000:8000"
     volumes:
@@ -54,29 +29,14 @@ services:
       dockerfile: Dockerfile
     container_name: deeptier-backend
     env_file:
-      - path: ./.env
+      - path: ./.env.bk
         required: false
     depends_on:
-      postgres:
-        condition: service_healthy
       ai:
         condition: service_started
     environment:
-      DB_URL: jdbc:postgresql://postgres:5432/${DB_NAME:-deeptier}
-      DB_DRIVER: org.postgresql.Driver
-      DB_USERNAME: ${DB_USERNAME:-postgres}
-      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      SPRING_PROFILES_ACTIVE: hana
       DEEPTIER_PYTHON_URL: http://ai:8000
-      DEEPTIER_INTERNAL_KEY: ${DEEPTIER_INTERNAL_KEY:-dt-internal-dev-key-2026}
-      DEEPTIER_AUTH_ENABLED: ${DEEPTIER_AUTH_ENABLED:-true}
-      DEEPTIER_JWT_SECRET: ${DEEPTIER_JWT_SECRET:-deeptier-dev-jwt-secret-change-in-prod-2026-min-32-bytes}
-      DEEPTIER_JWT_EXPIRATION_SECONDS: ${DEEPTIER_JWT_EXPIRATION_SECONDS:-86400}
-      DEEPTIER_DEMO_RESET_ENABLED: ${DEEPTIER_DEMO_RESET_ENABLED:-true}
-      DEEPTIER_CORS_ORIGINS: ${DEEPTIER_CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
-      S4HANA_BASE_URL: ${S4HANA_BASE_URL:-}
-      S4HANA_USERNAME: ${S4HANA_USERNAME:-}
-      S4HANA_PASSWORD: ${S4HANA_PASSWORD:-}
-      S4HANA_BEARER_TOKEN: ${S4HANA_BEARER_TOKEN:-}
     ports:
       - "8080:8080"
     healthcheck:
@@ -89,7 +49,6 @@ services:
       - deeptier-net
 
 volumes:
-  postgres_data:
   ai_data:
 
 networks:
